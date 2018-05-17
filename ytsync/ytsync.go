@@ -88,8 +88,10 @@ func (s *Sync) FullCycle() error {
 		}
 		s.YoutubeChannelID = channelID
 	}
-
 	defaultWalletDir := os.Getenv("HOME") + "/.lbryum/wallets/default_wallet"
+	if os.Getenv("REGTEST") == "true" {
+		defaultWalletDir = os.Getenv("HOME") + "/.lbryum_regtest/wallets/default_wallet"
+	}
 	walletBackupDir := os.Getenv("HOME") + "/wallets/" + strings.Replace(s.LbryChannelName, "@", "", 1)
 
 	if _, err := os.Stat(defaultWalletDir); !os.IsNotExist(err) {
@@ -188,7 +190,7 @@ func (s *Sync) doSync() error {
 
 	err = s.walletSetup()
 	if err != nil {
-		return err
+		return errors.Err("Initial wallet setup failed! Manual Intervention is required. Reason: %v", err)
 	}
 
 	if s.StopOnError {
@@ -279,7 +281,7 @@ func (s *Sync) startWorker(workerNum int) {
 						log.Println("Retrying")
 						continue
 					}
-					util.SendToSlackError("Video failed after %d retries, skipping. Stack: %s", s.MaxTries, logMsg)
+					util.SendToSlackError("Video failed after %d retries, skipping. Stack: %s", tryCount, logMsg)
 				}
 			}
 			break
