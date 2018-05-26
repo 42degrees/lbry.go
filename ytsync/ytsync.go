@@ -23,10 +23,6 @@ import (
 	"github.com/lbryio/lbry.go/util"
 	"github.com/lbryio/lbry.go/ytsync/redisdb"
 	"github.com/lbryio/lbry.go/ytsync/sources"
-
-	"fmt"
-
-	"github.com/lbryio/lbry.go/util"
 	"github.com/mitchellh/go-ps"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/api/googleapi/transport"
@@ -78,7 +74,7 @@ type Sync struct {
 // IsInterrupted can be queried to discover if the sync process was interrupted manually
 func (s *Sync) IsInterrupted() bool {
 	select {
-	case <-s.stop.Chan():
+	case <-s.stop.Ch():
 		return true
 	default:
 		return false
