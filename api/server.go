@@ -15,20 +15,8 @@ import (
 	"github.com/spf13/cast"
 )
 
-const authTokenParam = "auth_token"
-
-// Server HTTP Header Settings. Set on header if exists
-// ie. "Content-Type" - "application/json; charset=utf-8"
-// ie. "X-Content-Type-Options" - "nosniff"
-// ie. "X-Frame-Options" - "deny"
-// ie."Content-Security-Policy" - "default-src 'none'"
-// ie. "X-XSS-Protection" - "1; mode=block"
-// ie. "Server" - "lbry.io"
-// ie. "Referrer-Policy" - "same-origin"
-// ie. "Strict-Transport-Security" - "max-age=31536000; preload"
-// ie. "Access-Control-Allow-Origin" -"<header.Origin>"
-// ie. "Access-Control-Allow-Methods" - "GET, POST, OPTIONS"
-var HeaderSettings map[string]string
+// ResponseHeaders are returned with each response
+var ResponseHeaders map[string]string
 
 // LogError Allows specific error logging for the server at specific points.
 var LogError = func(*http.Request, *Response, error) {}
@@ -39,20 +27,13 @@ var LogInfo = func(*http.Request, *Response) {}
 // TraceEnabled Attaches a trace field to the JSON response when enabled.
 var TraceEnabled = false
 
-var ErrAuthenticationRequired = errors.Base("authentication required")
-var ErrNotAuthenticated = errors.Base("could not authenticate user")
-var ErrForbidden = errors.Base("you are not authorized to perform this action")
-
 // StatusError represents an error with an associated HTTP status code.
 type StatusError struct {
 	Status int
 	Err    error
 }
 
-// Allows StatusError to satisfy the error interface.
-func (se StatusError) Error() string {
-	return se.Err.Error()
-}
+func (se StatusError) Error() string { return se.Err.Error() }
 
 // Response is returned by API handlers
 type Response struct {
@@ -81,9 +62,9 @@ func (h Handler) callHandlerSafely(r *http.Request) (rsp Response) {
 
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Set header settings
-	if HeaderSettings != nil {
+	if ResponseHeaders != nil {
 		//Multiple readers, no writers is okay
-		for key, value := range HeaderSettings {
+		for key, value := range ResponseHeaders {
 			w.Header().Set(key, value)
 		}
 	}
@@ -97,12 +78,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if rsp.Status == 0 {
 		if rsp.Error != nil {
-			if statusError, ok := rsp.Error.(StatusError); ok {
+			ogErr := errors.Unwrap(rsp.Error)
+			if statusError, ok := ogErr.(StatusError); ok {
 				rsp.Status = statusError.Status
-			} else if errors.Is(rsp.Error, ErrAuthenticationRequired) {
-				rsp.Status = http.StatusUnauthorized
-			} else if errors.Is(rsp.Error, ErrNotAuthenticated) || errors.Is(rsp.Error, ErrForbidden) {
-				rsp.Status = http.StatusForbidden
 			} else {
 				rsp.Status = http.StatusInternalServerError
 			}
@@ -171,6 +149,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(rsp.Status)
 	w.Write(jsonResponse)
 }
+
+// IgnoredFormFields are ignored by FormValues() when checking for extraneous fields
+var IgnoredFormFields []string
 
 func FormValues(r *http.Request, params interface{}, validationRules []*v.FieldRules) error {
 	ref := reflect.ValueOf(params)
@@ -255,6 +236,21 @@ func FormValues(r *http.Request, params interface{}, validationRules []*v.FieldR
 					underscoredName, strings.Join(validator.GetBoolStringValues(), ", "))
 			}
 			finalValue = reflect.ValueOf(validator.IsTruthy(value))
+
+		case reflect.Float32, reflect.Float64:
+			if value == "" {
+				continue
+			}
+			castVal, err := cast.ToFloat64E(value)
+			if err != nil {
+				return errors.Err("%s: must be a floating point number", underscoredName)
+			}
+			switch structFieldKind {
+			case reflect.Float32:
+				finalValue = reflect.ValueOf(float32(castVal))
+			case reflect.Float64:
+				finalValue = reflect.ValueOf(float64(castVal))
+			}
 		default:
 			return errors.Err("field %s is an unsupported type", name)
 		}
@@ -271,7 +267,7 @@ func FormValues(r *http.Request, params interface{}, validationRules []*v.FieldR
 
 	var extraParams []string
 	for k := range r.Form {
-		if _, ok := fields[k]; !ok && k != authTokenParam { //TODO: fix this AUTH_PARAM hack
+		if _, ok := fields[k]; !ok && !util.InSlice(k, IgnoredFormFields) {
 			extraParams = append(extraParams, k)
 		}
 	}

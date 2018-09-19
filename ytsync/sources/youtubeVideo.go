@@ -59,18 +59,14 @@ func (v YoutubeVideo) PublishedAt() time.Time {
 }
 
 func (v YoutubeVideo) getFilename() string {
-	return v.dir + "/" + v.getClaimName() + ".mp4"
-}
-
-func (v YoutubeVideo) getClaimName() string {
-	maxLen := 40
+	maxLen := 30
 	reg := regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
 	chunks := strings.Split(strings.ToLower(strings.Trim(reg.ReplaceAllString(v.title, "-"), "-")), "-")
 
 	name := chunks[0]
 	if len(name) > maxLen {
-		return name[:maxLen]
+		name = name[:maxLen]
 	}
 
 	for _, chunk := range chunks[1:] {
@@ -83,8 +79,10 @@ func (v YoutubeVideo) getClaimName() string {
 		}
 		name = tmpName
 	}
-
-	return name
+	if len(name) < 1 {
+		name = v.id
+	}
+	return v.videoDir() + "/" + name + ".mp4"
 }
 
 func (v YoutubeVideo) getAbbrevDescription() string {
@@ -99,7 +97,12 @@ func (v YoutubeVideo) getAbbrevDescription() string {
 func (v YoutubeVideo) download() error {
 	videoPath := v.getFilename()
 
-	_, err := os.Stat(videoPath)
+	err := os.Mkdir(v.videoDir(), 0750)
+	if err != nil && !strings.Contains(err.Error(), "file exists") {
+		return errors.Wrap(err, 0)
+	}
+
+	_, err = os.Stat(videoPath)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	} else if err == nil {
@@ -114,7 +117,7 @@ func (v YoutubeVideo) download() error {
 	}
 
 	var downloadedFile *os.File
-	downloadedFile, err = os.Create(v.getFilename())
+	downloadedFile, err = os.Create(videoPath)
 	if err != nil {
 		return err
 	}
@@ -124,10 +127,15 @@ func (v YoutubeVideo) download() error {
 	return videoInfo.Download(videoInfo.Formats.Best(ytdl.FormatAudioEncodingKey)[0], downloadedFile)
 }
 
+func (v YoutubeVideo) videoDir() string {
+	return v.dir + "/" + v.id
+}
+
 func (v YoutubeVideo) delete() error {
 	videoPath := v.getFilename()
 	err := os.Remove(videoPath)
 	if err != nil {
+		log.Errorln(errors.Prefix("delete error", err))
 		return err
 	}
 	log.Debugln(v.id + " deleted from disk (" + videoPath + ")")
@@ -177,50 +185,56 @@ func (v YoutubeVideo) triggerThumbnailSave() error {
 
 func strPtr(s string) *string { return &s }
 
-func (v YoutubeVideo) publish(daemon *jsonrpc.Client, claimAddress string, amount float64, channelName string) error {
+func (v YoutubeVideo) publish(daemon *jsonrpc.Client, claimAddress string, amount float64, channelID string) (*SyncSummary, error) {
+	if channelID == "" {
+		return nil, errors.Err("a claim_id for the channel wasn't provided") //TODO: this is probably not needed?
+	}
 	options := jsonrpc.PublishOptions{
-		Title:        &v.title,
-		Author:       &v.channelTitle,
-		Description:  strPtr(v.getAbbrevDescription() + "\nhttps://www.youtube.com/watch?v=" + v.id),
-		Language:     strPtr("en"),
-		ClaimAddress: &claimAddress,
-		Thumbnail:    strPtr("https://berk.ninja/thumbnails/" + v.id),
-		License:      strPtr("Copyrighted (contact author)"),
+		Title:         &v.title,
+		Author:        &v.channelTitle,
+		Description:   strPtr(v.getAbbrevDescription() + "\nhttps://www.youtube.com/watch?v=" + v.id),
+		Language:      strPtr("en"),
+		ClaimAddress:  &claimAddress,
+		Thumbnail:     strPtr("https://berk.ninja/thumbnails/" + v.id),
+		License:       strPtr("Copyrighted (contact author)"),
+		ChangeAddress: &claimAddress,
+		ChannelID:     &channelID,
 	}
-	if channelName != "" {
-		options.ChannelName = &channelName
-	}
-
 	return publishAndRetryExistingNames(daemon, v.title, v.getFilename(), amount, options)
 }
 
-func (v YoutubeVideo) Sync(daemon *jsonrpc.Client, claimAddress string, amount float64, channelName string) error {
+func (v YoutubeVideo) Sync(daemon *jsonrpc.Client, claimAddress string, amount float64, channelID string, maxVideoSize int) (*SyncSummary, error) {
 	//download and thumbnail can be done in parallel
 	err := v.download()
 	if err != nil {
-		return errors.Prefix("download error", err)
+		return nil, errors.Prefix("download error", err)
 	}
 	log.Debugln("Downloaded " + v.id)
 
+	fi, err := os.Stat(v.getFilename())
+	if err != nil {
+		return nil, err
+	}
+	if fi.Size() > int64(maxVideoSize)*1024*1024 {
+		//delete the video and ignore the error
+		_ = v.delete()
+		return nil, errors.Err("the video is too big to sync, skipping for now")
+	}
+
 	err = v.triggerThumbnailSave()
 	if err != nil {
-		return errors.Prefix("thumbnail error", err)
+		return nil, errors.Prefix("thumbnail error", err)
 	}
 	log.Debugln("Created thumbnail for " + v.id)
 
-	err = v.publish(daemon, claimAddress, amount, channelName)
+	summary, err := v.publish(daemon, claimAddress, amount, channelID)
+	//delete the video in all cases (and ignore the error)
+	_ = v.delete()
 	if err != nil {
-		return errors.Prefix("publish error", err)
+		return nil, errors.Prefix("publish error", err)
 	}
 
-	err = v.delete()
-	if err != nil {
-		// the video was published anyway so it should be marked as published
-		// for that to happen, no errors should be returned any further than here
-		log.Debugln(errors.Prefix("delete error", err))
-	}
-
-	return nil
+	return summary, nil
 }
 
 // sorting videos

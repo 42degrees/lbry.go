@@ -13,6 +13,9 @@ import (
 )
 
 func (s *Sync) walletSetup() error {
+	//prevent unnecessary concurrent execution
+	s.walletMux.Lock()
+	defer s.walletMux.Unlock()
 	err := s.ensureChannelOwnership()
 	if err != nil {
 		return err
@@ -27,26 +30,36 @@ func (s *Sync) walletSetup() error {
 	balance := decimal.Decimal(*balanceResp)
 	log.Debugf("Starting balance is %s", balance.String())
 
-	var numOnSource uint64
+	var numOnSource int
 	if s.LbryChannelName == "@UCBerkeley" {
 		numOnSource = 10104
 	} else {
-		numOnSource, err = s.CountVideos()
+		n, err := s.CountVideos()
 		if err != nil {
 			return err
 		}
+		numOnSource = int(n)
 	}
 	log.Debugf("Source channel has %d videos", numOnSource)
-
-	numPublished, err := s.daemon.NumClaimsInChannel(s.LbryChannelName)
-	if err != nil {
-		return err
+	if numOnSource == 0 {
+		return nil
 	}
+
+	s.syncedVideosMux.Lock()
+	numPublished := len(s.syncedVideos) //should we only count published videos? Credits are allocated even for failed ones...
+	s.syncedVideosMux.Unlock()
 	log.Debugf("We already published %d videos", numPublished)
 
-	minBalance := (float64(numOnSource)-float64(numPublished))*publishAmount + channelClaimAmount
+	if numOnSource-numPublished > s.Manager.VideosLimit {
+		numOnSource = s.Manager.VideosLimit
+	}
+
+	minBalance := (float64(numOnSource)-float64(numPublished))*(publishAmount+0.1) + channelClaimAmount
+	if numPublished > numOnSource && balance.LessThan(decimal.NewFromFloat(1)) {
+		SendErrorToSlack("something is going on as we published more videos than those available on source: %d/%d", numPublished, numOnSource)
+		minBalance = 1 //since we ended up in this function it means some juice is still needed
+	}
 	amountToAdd, _ := decimal.NewFromFloat(minBalance).Sub(balance).Float64()
-	amountToAdd *= 1.5 // add 50% margin for fees, future publishes, etc
 
 	if s.Refill > 0 {
 		if amountToAdd < 0 {
@@ -90,12 +103,8 @@ func (s *Sync) ensureEnoughUTXOs() error {
 		return errors.Err("no response")
 	}
 
-	if !allUTXOsConfirmed(utxolist) {
-		log.Println("Waiting for previous txns to confirm") // happens if you restarted the daemon soon after a previous publish run
-		s.waitUntilUTXOsConfirmed()
-	}
-
-	target := 60
+	target := 40
+	slack := int(float32(0.1) * float32(target))
 	count := 0
 
 	for _, utxo := range *utxolist {
@@ -104,7 +113,7 @@ func (s *Sync) ensureEnoughUTXOs() error {
 		}
 	}
 
-	if count < target {
+	if count < target-slack {
 		newAddresses := target - count
 
 		balance, err := s.daemon.WalletBalance()
@@ -125,12 +134,13 @@ func (s *Sync) ensureEnoughUTXOs() error {
 			return errors.Err("no response")
 		}
 
-		wait := 15 * time.Second
-		log.Println("Waiting " + wait.String() + " for lbryum to let us know we have the new addresses")
-		time.Sleep(wait)
-
-		log.Println("Creating UTXOs and waiting for them to be confirmed")
-		err = s.waitUntilUTXOsConfirmed()
+		err = s.waitForNewBlock()
+		if err != nil {
+			return err
+		}
+	} else if !allUTXOsConfirmed(utxolist) {
+		log.Println("Waiting for previous txns to confirm")
+		err := s.waitForNewBlock()
 		if err != nil {
 			return err
 		}
@@ -139,23 +149,31 @@ func (s *Sync) ensureEnoughUTXOs() error {
 	return nil
 }
 
-func (s *Sync) waitUntilUTXOsConfirmed() error {
-	for {
-		r, err := s.daemon.UTXOList()
+func (s *Sync) waitForNewBlock() error {
+	status, err := s.daemon.Status()
+	if err != nil {
+		return err
+	}
+
+	for status.Wallet.Blocks == 0 || status.Wallet.BlocksBehind != 0 {
+		time.Sleep(5 * time.Second)
+		status, err = s.daemon.Status()
 		if err != nil {
 			return err
-		} else if r == nil {
-			return errors.Err("no response")
 		}
-
-		if allUTXOsConfirmed(r) {
-			return nil
-		}
-
-		wait := 30 * time.Second
-		log.Println("Waiting " + wait.String() + "...")
-		time.Sleep(wait)
 	}
+	currentBlock := status.Wallet.Blocks
+	for i := 0; status.Wallet.Blocks <= currentBlock; i++ {
+		if i%3 == 0 {
+			log.Printf("Waiting for new block (%d)...", currentBlock+1)
+		}
+		time.Sleep(10 * time.Second)
+		status, err = s.daemon.Status()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Sync) ensureChannelOwnership() error {
@@ -173,6 +191,7 @@ func (s *Sync) ensureChannelOwnership() error {
 	isChannelMine := false
 	for _, channel := range *channels {
 		if channel.Name == s.LbryChannelName {
+			s.lbryChannelID = channel.ClaimID
 			isChannelMine = true
 		} else {
 			return errors.Err("this wallet has multiple channels. maybe something went wrong during setup?")
@@ -211,16 +230,11 @@ func (s *Sync) ensureChannelOwnership() error {
 		s.addCredits(channelBidAmount + 0.1)
 	}
 
-	_, err = s.daemon.ChannelNew(s.LbryChannelName, channelBidAmount)
+	c, err := s.daemon.ChannelNew(s.LbryChannelName, channelBidAmount)
 	if err != nil {
 		return err
 	}
-
-	// niko's code says "unfortunately the queues in the daemon are not yet merged so we must give it some time for the channel to go through"
-	wait := 15 * time.Second
-	log.Println("Waiting " + wait.String() + " for channel claim to go through")
-	time.Sleep(wait)
-
+	s.lbryChannelID = c.ClaimID
 	return nil
 }
 
@@ -244,9 +258,18 @@ func allUTXOsConfirmed(utxolist *jsonrpc.UTXOListResponse) bool {
 
 func (s *Sync) addCredits(amountToAdd float64) error {
 	log.Printf("Adding %f credits", amountToAdd)
-	lbrycrdd, err := lbrycrd.NewWithDefaultURL()
-	if err != nil {
-		return err
+	var lbrycrdd *lbrycrd.Client
+	var err error
+	if s.LbrycrdString == "" {
+		lbrycrdd, err = lbrycrd.NewWithDefaultURL()
+		if err != nil {
+			return err
+		}
+	} else {
+		lbrycrdd, err = lbrycrd.New(s.LbrycrdString)
+		if err != nil {
+			return err
+		}
 	}
 
 	addressResp, err := s.daemon.WalletUnusedAddress()
@@ -266,6 +289,5 @@ func (s *Sync) addCredits(amountToAdd float64) error {
 	log.Println("Waiting " + wait.String() + " for lbryum to let us know we have the new transaction")
 	time.Sleep(wait)
 
-	log.Println("Waiting for transaction to be confirmed")
-	return s.waitUntilUTXOsConfirmed()
+	return nil
 }
